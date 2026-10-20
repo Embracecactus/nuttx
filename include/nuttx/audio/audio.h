@@ -891,6 +891,10 @@ struct audio_ops_s
    *
    * Any enqueued Audio Pipeline Buffers that have not been
    * processed / dequeued should be dequeued by this function.
+   * The upper half calls shutdown without its callback spinlock held.
+   * Success means all buffer and completion callbacks have returned and no
+   * new callbacks can begin until the device is configured again.  On error
+   * the upper half retains callback state and retries shutdown on next open.
    */
 
   CODE int (*shutdown)(FAR struct audio_lowerhalf_s *dev);

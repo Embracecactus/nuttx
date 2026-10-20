@@ -201,8 +201,8 @@ get_capture_type_inf(FAR capture_mng_t *cmng, uint8_t type);
 static enum capture_state_e
 estimate_next_capture_state(FAR capture_mng_t *cmng,
                             enum capture_state_cause_e cause);
-static void change_capture_state(FAR capture_mng_t *cmng,
-                                 enum capture_state_e next_state);
+static int change_capture_state(FAR capture_mng_t *cmng,
+                                enum capture_state_e next_state);
 static bool is_taking_still_picture(FAR capture_mng_t *cmng);
 static bool is_bufsize_sufficient(FAR capture_mng_t *cmng, uint32_t bufsize);
 static void cleanup_resources(FAR capture_mng_t *cmng);
@@ -819,6 +819,7 @@ static int start_capture(FAR struct capture_mng_s *cmng,
 
   imgdata_interval_t di;
   imgsensor_interval_t si;
+  int ret;
 
   ASSERT(fmt && interval && cmng->imgsensor && cmng->imgdata);
 
@@ -831,15 +832,41 @@ static int start_capture(FAR struct capture_mng_s *cmng,
   convert_to_imgsensorfmt(&fmt[CAPTURE_FMT_SUB], &sf[IMGSENSOR_FMT_SUB]);
   convert_to_imgsensorinterval(interval, &si);
 
-  IMGDATA_SET_BUF(cmng->imgdata,
+  ret = IMGDATA_SET_BUF(cmng->imgdata,
      nr_fmt, df, (FAR uint8_t *)bufaddr, bufsize);
-  IMGDATA_START_CAPTURE(cmng->imgdata,
+  if (ret < 0)
+    {
+      goto errout_data;
+    }
+
+  ret = IMGDATA_START_CAPTURE(cmng->imgdata,
      nr_fmt, df, &di, complete_capture, cmng);
-  IMGSENSOR_START_CAPTURE(cmng->imgsensor,
+  if (ret < 0)
+    {
+      goto errout_data;
+    }
+
+  ret = IMGSENSOR_START_CAPTURE(cmng->imgsensor,
      type == V4L2_BUF_TYPE_VIDEO_CAPTURE ?
      IMGSENSOR_STREAM_TYPE_VIDEO : IMGSENSOR_STREAM_TYPE_STILL,
      nr_fmt, sf, &si);
+  if (ret < 0)
+    {
+      IMGSENSOR_STOP_CAPTURE(cmng->imgsensor,
+        type == V4L2_BUF_TYPE_VIDEO_CAPTURE ?
+        IMGSENSOR_STREAM_TYPE_VIDEO : IMGSENSOR_STREAM_TYPE_STILL);
+      goto errout_data;
+    }
+
   return OK;
+
+errout_data:
+  /* A failed start must also revoke any destination accepted by SET_BUF.
+   * Keep the original failure so the caller can retry with a valid queue.
+   */
+
+  IMGDATA_STOP_CAPTURE(cmng->imgdata);
+  return ret;
 }
 
 static void stop_capture(FAR struct capture_mng_s *cmng,
@@ -853,11 +880,12 @@ static void stop_capture(FAR struct capture_mng_s *cmng,
     IMGSENSOR_STREAM_TYPE_VIDEO : IMGSENSOR_STREAM_TYPE_STILL);
 }
 
-static void change_capture_state(FAR capture_mng_t *cmng,
-                                 enum capture_state_e next_state)
+static int change_capture_state(FAR capture_mng_t *cmng,
+                                enum capture_state_e next_state)
 {
   enum capture_state_e current_state = cmng->capture_inf.state;
   enum capture_state_e updated_next_state = next_state;
+  int ret;
 
   if (current_state != CAPTURE_STATE_CAPTURE &&
       next_state    == CAPTURE_STATE_CAPTURE)
@@ -867,7 +895,7 @@ static void change_capture_state(FAR capture_mng_t *cmng,
       if (container != NULL)
         {
           cmng->capture_inf.seqnum = 0;
-          start_capture(cmng,
+          ret = start_capture(cmng,
                         V4L2_BUF_TYPE_VIDEO_CAPTURE,
                         cmng->capture_inf.nr_fmt,
                         cmng->capture_inf.fmt,
@@ -875,6 +903,10 @@ static void change_capture_state(FAR capture_mng_t *cmng,
                         &cmng->capture_inf.frame_interval,
                         container->buf.m.userptr,
                         container->buf.length);
+          if (ret < 0)
+            {
+              return ret;
+            }
         }
       else
         {
@@ -888,6 +920,7 @@ static void change_capture_state(FAR capture_mng_t *cmng,
     }
 
   cmng->capture_inf.state = updated_next_state;
+  return OK;
 }
 
 static bool is_taking_still_picture(FAR capture_mng_t *cmng)
@@ -1999,6 +2032,7 @@ static int complete_capture(uint8_t err_code,
   FAR vbuf_container_t *container = NULL;
   enum v4l2_buf_type buf_type;
   irqstate_t           flags;
+  int ret = OK;
   imgdata_format_t df[MAX_CAPTURE_FMT] =
     {
       0
@@ -2091,17 +2125,28 @@ static int complete_capture(uint8_t err_code,
           convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_SUB],
                                 &df[IMGDATA_FMT_SUB]);
 
-          IMGDATA_SET_BUF(cmng->imgdata,
+          ret = IMGDATA_SET_BUF(cmng->imgdata,
             type_inf->nr_fmt,
             df,
             (FAR uint8_t *)container->buf.m.userptr,
             container->buf.length);
-          container->buf.sequence = type_inf->seqnum++;
+          if (ret < 0)
+            {
+              /* Keep the next container queued for a later restart. */
+
+              stop_capture(cmng, buf_type);
+              type_inf->state = CAPTURE_STATE_STREAMON;
+              poll_notify(&type_inf->fds, 1, POLLERR);
+            }
+          else
+            {
+              container->buf.sequence = type_inf->seqnum++;
+            }
         }
     }
 
   spin_unlock_irqrestore_nopreempt(&cmng->lock, flags);
-  return OK;
+  return ret;
 }
 
 static FAR struct imgsensor_s *
@@ -2309,6 +2354,7 @@ static int capture_qbuf(FAR struct file *filep,
   FAR capture_type_inf_t *type_inf;
   FAR vbuf_container_t *container;
   enum capture_state_e next_capture_state;
+  int ret = OK;
 
   if (cmng == NULL || buf == NULL)
     {
@@ -2352,7 +2398,7 @@ static int capture_qbuf(FAR struct file *filep,
           nxmutex_lock(&cmng->still_inf.lock_state);
           next_capture_state =
             estimate_next_capture_state(cmng, CAUSE_CAPTURE_START);
-          change_capture_state(cmng, next_capture_state);
+          ret = change_capture_state(cmng, next_capture_state);
           nxmutex_unlock(&cmng->still_inf.lock_state);
         }
       else
@@ -2362,7 +2408,7 @@ static int capture_qbuf(FAR struct file *filep,
           if (container != NULL)
             {
               type_inf->seqnum = 0;
-              start_capture(cmng,
+              ret = start_capture(cmng,
                             buf->type,
                             type_inf->nr_fmt,
                             type_inf->fmt,
@@ -2370,13 +2416,16 @@ static int capture_qbuf(FAR struct file *filep,
                             &type_inf->frame_interval,
                             container->buf.m.userptr,
                             container->buf.length);
-              type_inf->state = CAPTURE_STATE_CAPTURE;
+              if (ret >= 0)
+                {
+                  type_inf->state = CAPTURE_STATE_CAPTURE;
+                }
             }
         }
     }
 
   nxmutex_unlock(&type_inf->lock_state);
-  return OK;
+  return ret;
 }
 
 static int capture_dqbuf(FAR struct file *filep,
@@ -2388,6 +2437,7 @@ static int capture_dqbuf(FAR struct file *filep,
   FAR vbuf_container_t *container;
   FAR sem_t *dqbuf_wait_flg;
   enum capture_state_e next_capture_state;
+  int ret;
 
   if (cmng == NULL || buf == NULL)
     {
@@ -2423,8 +2473,12 @@ static int capture_dqbuf(FAR struct file *filep,
               nxmutex_lock(&cmng->mutex);
               next_capture_state =
                 estimate_next_capture_state(cmng, CAUSE_CAPTURE_DQBUF);
-              change_capture_state(cmng, next_capture_state);
+              ret = change_capture_state(cmng, next_capture_state);
               nxmutex_unlock(&cmng->mutex);
+              if (ret < 0)
+                {
+                  return ret;
+                }
             }
 
           nxsem_wait_uninterruptible(dqbuf_wait_flg);
@@ -2778,7 +2832,7 @@ static int capture_streamon(FAR struct file *filep,
     {
       next_capture_state =
         estimate_next_capture_state(cmng, CAUSE_CAPTURE_START);
-      change_capture_state(cmng, next_capture_state);
+      ret = change_capture_state(cmng, next_capture_state);
     }
 
   nxmutex_unlock(&type_inf->lock_state);
@@ -2822,7 +2876,7 @@ static int capture_streamoff(FAR struct file *filep,
     {
       next_capture_state =
         estimate_next_capture_state(cmng, CAUSE_CAPTURE_STOP);
-      change_capture_state(cmng, next_capture_state);
+      ret = change_capture_state(cmng, next_capture_state);
     }
 
   nxmutex_unlock(&cmng->mutex);
@@ -2889,9 +2943,13 @@ static int capture_takepict_start(FAR struct file *filep,
 
       next_capture_state = estimate_next_capture_state(cmng,
                                                    CAUSE_STILL_START);
-      change_capture_state(cmng, next_capture_state);
+      ret = change_capture_state(cmng, next_capture_state);
 
       nxmutex_unlock(&cmng->mutex);
+      if (ret < 0)
+        {
+          goto errout;
+        }
 
       container =
         video_framebuff_get_vacant_container(&cmng->still_inf.bufinf);
@@ -2899,7 +2957,7 @@ static int capture_takepict_start(FAR struct file *filep,
         {
           /* Start still stream capture */
 
-          start_capture(cmng,
+          ret = start_capture(cmng,
                         V4L2_BUF_TYPE_STILL_CAPTURE,
                         cmng->still_inf.nr_fmt,
                         cmng->still_inf.fmt,
@@ -2908,7 +2966,10 @@ static int capture_takepict_start(FAR struct file *filep,
                         container->buf.m.userptr,
                         container->buf.length);
 
-          cmng->still_inf.state = CAPTURE_STATE_CAPTURE;
+          if (ret >= 0)
+            {
+              cmng->still_inf.state = CAPTURE_STATE_CAPTURE;
+            }
         }
       else
         {
@@ -2916,6 +2977,7 @@ static int capture_takepict_start(FAR struct file *filep,
         }
     }
 
+errout:
   nxmutex_unlock(&cmng->still_inf.lock_state);
   return ret;
 }
@@ -2958,7 +3020,7 @@ static int capture_takepict_stop(FAR struct file *filep,
       nxmutex_lock(&cmng->capture_inf.lock_state);
       next_capture_state = estimate_next_capture_state(cmng,
                                                    CAUSE_STILL_STOP);
-      change_capture_state(cmng, next_capture_state);
+      ret = change_capture_state(cmng, next_capture_state);
       nxmutex_unlock(&cmng->capture_inf.lock_state);
     }
 

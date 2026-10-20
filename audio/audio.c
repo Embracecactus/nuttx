@@ -105,6 +105,7 @@ struct audio_upperhalf_s
 
 static int      audio_open(FAR struct file *filep);
 static int      audio_close(FAR struct file *filep);
+static int      audio_shutdown(FAR struct audio_upperhalf_s *upper);
 static ssize_t  audio_read(FAR struct file *filep,
                            FAR char *buffer,
                            size_t buflen);
@@ -179,6 +180,7 @@ static int audio_open(FAR struct file *filep)
   ret = nxmutex_lock(&upper->lock);
   if (ret < 0)
     {
+      kmm_free(priv);
       return ret;
     }
 
@@ -186,6 +188,20 @@ static int audio_open(FAR struct file *filep)
 
   if (upper->head == NULL)
     {
+      /* A failed last-close retains the status until the lower half has
+       * stopped all callbacks. Retry that teardown before admitting a new
+       * session; close errors do not preserve the old file descriptor.
+       */
+
+      if (upper->status != NULL)
+        {
+          ret = audio_shutdown(upper);
+          if (ret < 0)
+            {
+              goto errout;
+            }
+        }
+
       upper->status = kumm_zalloc(sizeof(struct audio_status_s));
       if (!upper->status)
         {
@@ -206,7 +222,7 @@ errout:
   nxmutex_unlock(&upper->lock);
   if (ret < 0)
     {
-      kumm_free(priv);
+      kmm_free(priv);
     }
 
   return ret;
@@ -254,7 +270,9 @@ static int audio_close(FAR struct file *filep)
       upper->head = priv->flink;
     }
 
+  spin_unlock_irqrestore(&upper->spinlock, flags);
   kmm_free(priv);
+  filep->f_priv = NULL;
 
   /*  If the reference head decrement to NULL,
    *  then uninitialize the driver.
@@ -262,21 +280,17 @@ static int audio_close(FAR struct file *filep)
 
   if (upper->head == NULL)
     {
-      FAR struct audio_lowerhalf_s *lower = upper->dev;
+      /* Keep the sleeping lifecycle mutex, but release the spinlock before
+       * shutdown joins workers or returns queued buffers through callbacks.
+       */
 
-      /* Disable the Audio device */
-
-      DEBUGASSERT(lower->ops->shutdown != NULL);
-      audinfo("calling shutdown\n");
-
-      lower->ops->shutdown(lower);
-      kumm_free(upper->status);
-      upper->status = NULL;
+      ret = audio_shutdown(upper);
+    }
+  else
+    {
+      ret = OK;
     }
 
-  spin_unlock_irqrestore(&upper->spinlock, flags);
-
-  ret = OK;
   nxmutex_unlock(&upper->lock);
 
   return ret;
@@ -764,6 +778,51 @@ static int audio_freebuffer(FAR struct audio_upperhalf_s *upper,
     }
 
   return ret;
+}
+
+/****************************************************************************
+ * Name: audio_shutdown
+ *
+ * Description:
+ *   Called with upper->lock held and no open descriptors. A successful lower
+ *   shutdown joins all callbacks before status and shared buffers are freed.
+ *   On error, retain their ownership and retry on the next open.
+ *
+ ****************************************************************************/
+
+static int audio_shutdown(FAR struct audio_upperhalf_s *upper)
+{
+  FAR struct audio_lowerhalf_s *lower = upper->dev;
+  FAR struct audio_status_s *status;
+  struct audio_buf_desc_s desc;
+  irqstate_t flags;
+  int ret;
+
+  DEBUGASSERT(upper->head == NULL);
+  DEBUGASSERT(lower->ops->shutdown != NULL);
+  ret = lower->ops->shutdown(lower);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  while (upper->periods != 0)
+    {
+      memset(&desc, 0, sizeof(desc));
+      ret = audio_freebuffer(upper, &desc);
+      if (ret <= 0)
+        {
+          return ret < 0 ? ret : -EIO;
+        }
+    }
+
+  flags = spin_lock_irqsave(&upper->spinlock);
+  status = upper->status;
+  upper->status = NULL;
+  spin_unlock_irqrestore(&upper->spinlock, flags);
+  kumm_free(status);
+  memset(&upper->info, 0, sizeof(upper->info));
+  return OK;
 }
 
 /****************************************************************************
