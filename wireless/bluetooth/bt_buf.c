@@ -389,14 +389,16 @@ void bt_buf_release(FAR struct bt_buf_s *buf)
   uint16_t handle;
 #endif
   irqstate_t flags;
+  uint8_t ref;
 
-  wlinfo("buf %p ref %u type %d\n", buf, buf->ref, buf->type);
+  /* The TX thread, receive worker and synchronous waiter can release their
+   * references concurrently. Publish buffer contents before the last free.
+   */
 
-  DEBUGASSERT(buf->ref > 0);
-
-  if (--buf->ref > 0)
+  ref = __atomic_fetch_sub(&buf->ref, 1, __ATOMIC_ACQ_REL);
+  DEBUGASSERT(ref > 0);
+  if (ref > 1)
     {
-      wlinfo("Remaining references: %d\n", buf->ref);
       return;
     }
 
@@ -503,9 +505,11 @@ void bt_buf_release(FAR struct bt_buf_s *buf)
 
 FAR struct bt_buf_s *bt_buf_addref(FAR struct bt_buf_s *buf)
 {
-  wlinfo("buf %p (old) ref %u type %d\n", buf, buf->ref, buf->type);
+  uint8_t ref;
 
-  buf->ref++;
+  ref = __atomic_fetch_add(&buf->ref, 1, __ATOMIC_RELAXED);
+  DEBUGASSERT(ref > 0 && ref < UINT8_MAX);
+  UNUSED(ref);
   return buf;
 }
 

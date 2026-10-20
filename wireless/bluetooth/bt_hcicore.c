@@ -57,6 +57,7 @@
 
 #include <nuttx/clock.h>
 #include <nuttx/kthread.h>
+#include <nuttx/mutex.h>
 #include <nuttx/spinlock.h>
 #include <nuttx/wqueue.h>
 #include <nuttx/net/bluetooth.h>
@@ -80,6 +81,17 @@
  */
 
 #define TIMEOUT_MSEC   2500
+
+/****************************************************************************
+ * Private Types
+ ****************************************************************************/
+
+struct hci_cmd_sync_s
+{
+  sem_t sem;
+  FAR struct bt_buf_s *response;
+  int result;
+};
 
 /****************************************************************************
  * Public Data
@@ -116,6 +128,13 @@ static FAR struct bt_bufferlist_s g_hp_rxlist;
 
 static struct work_s g_lp_work;
 static struct work_s g_hp_work;
+
+/* Command completion runs in the receive work queue. Serialize its access
+ * to a waiter's stack context with timeout detachment and the TX handoff.
+ * Never hold this mutex while waiting for a command or sending to a queue.
+ */
+
+static mutex_t g_hci_sync_lock = NXMUTEX_INITIALIZER;
 
 /****************************************************************************
  * Private Functions
@@ -317,53 +336,55 @@ static void hci_reset_complete(FAR struct bt_buf_s *buf)
 static void hci_cmd_done(uint16_t opcode, uint8_t status,
                          FAR struct bt_buf_s *buf)
 {
-  FAR struct bt_buf_s *sent = g_btdev.sent_cmd;
+  FAR struct bt_buf_s *sent;
+  FAR struct hci_cmd_sync_s *sync;
+  bool synchronous;
 
+  nxmutex_lock(&g_hci_sync_lock);
+  sent = g_btdev.sent_cmd;
   if (sent == NULL)
     {
+      nxmutex_unlock(&g_hci_sync_lock);
       return;
     }
 
-  if (g_btdev.sent_cmd == NULL)
+  if (sent->u.hci.opcode != opcode)
     {
-      wlerr("ERROR: Request cmd missing!\n");
-      return;
-    }
+      uint16_t expected = sent->u.hci.opcode;
 
-  if (g_btdev.sent_cmd->u.hci.opcode != opcode)
-    {
-      wlerr("ERROR:  Unexpected completion of opcode 0x%04x "
-            "expected 0x%04x\n",
-            opcode, g_btdev.sent_cmd->u.hci.opcode);
+      nxmutex_unlock(&g_hci_sync_lock);
+      wlerr("ERROR: Unexpected completion of opcode 0x%04x "
+            "expected 0x%04x\n", opcode, expected);
       return;
     }
 
   g_btdev.sent_cmd = NULL;
+  sync = sent->u.hci.sync;
+  synchronous = sync != NULL;
+  sent->u.hci.sync = NULL;
+
+  if (sync != NULL)
+    {
+      sync->result = status == 0 ? 0 : -EIO;
+      if (status == 0)
+        {
+          sync->response = bt_buf_addref(buf);
+        }
+
+      /* Keep the context attached to this mutex until post has returned.
+       * A timed-out waiter must acquire it before destroying its semaphore.
+       */
+
+      nxsem_post(&sync->sem);
+    }
+
+  nxmutex_unlock(&g_hci_sync_lock);
 
   if (status != 0)
     {
       syslog(LOG_ERR,
              "[BT] HCI cmd opcode 0x%04x rejected, status 0x%02x %s\n",
-             sent->u.hci.opcode, status,
-             (sent->u.hci.sync != NULL) ? "(sync)" : "(async)");
-    }
-
-  /* If the command was synchronous wake up bt_hci_cmd_send_sync() */
-
-  if (sent->u.hci.sync != NULL)
-    {
-      FAR sem_t *sem = sent->u.hci.sync;
-
-      if (status != 0)
-        {
-          sent->u.hci.sync = NULL;
-        }
-      else
-        {
-          sent->u.hci.sync = bt_buf_addref(buf);
-        }
-
-      nxsem_post(sem);
+             opcode, status, synchronous ? "(sync)" : "(async)");
     }
 
   bt_buf_release(sent);
@@ -1029,6 +1050,8 @@ static int hci_tx_kthread(int argc, FAR char *argv[])
   for (; g_btdev.tx_status == OK; )
     {
       FAR struct bt_buf_s *buf;
+      FAR struct bt_buf_s *previous;
+      bool send;
 
       /* Wait until ncmd > 0 */
 
@@ -1048,24 +1071,25 @@ static int hci_tx_kthread(int argc, FAR char *argv[])
 
       g_btdev.ncmd = 0;
 
-      /* Clear out any existing sent command */
-
-      if (g_btdev.sent_cmd)
-        {
-          wlerr("ERROR:  Uncleared pending sent_cmd\n");
-          bt_buf_release(g_btdev.sent_cmd);
-          g_btdev.sent_cmd = NULL;
-        }
-
-      /* Allow transmission if module is connected. */
-
-      if (g_btdev.tx_status == OK)
+      nxmutex_lock(&g_hci_sync_lock);
+      previous = g_btdev.sent_cmd;
+      g_btdev.sent_cmd = NULL;
+      send = g_btdev.tx_status == OK;
+      if (send)
         {
           g_btdev.sent_cmd = bt_buf_addref(buf);
+        }
 
-          wlinfo("Sending command %04x buf %p to driver\n",
-                 buf->u.hci.opcode, buf);
+      nxmutex_unlock(&g_hci_sync_lock);
 
+      if (previous != NULL)
+        {
+          wlerr("ERROR: Uncleared pending sent_cmd\n");
+          bt_buf_release(previous);
+        }
+
+      if (send)
+        {
           bt_send(btdev, buf);
         }
 
@@ -1969,88 +1993,73 @@ int bt_hci_cmd_send(uint16_t opcode, FAR struct bt_buf_s *buf)
 int bt_hci_cmd_send_sync(uint16_t opcode, FAR struct bt_buf_s *buf,
                          FAR struct bt_buf_s **rsp)
 {
-  sem_t sync_sem;
+  struct hci_cmd_sync_s sync;
   int ret;
 
-  /* NOTE: This function cannot be called from the rx thread since it relies
-   * on the very same thread in processing the cmd_complete event and giving
-   * back the blocking semaphore.
-   */
+  /* The receive worker must remain able to process command completion. */
+
+  if (rsp != NULL)
+    {
+      *rsp = NULL;
+    }
 
   if (buf == NULL)
     {
       buf = bt_hci_cmd_create(opcode, 0);
       if (buf == NULL)
         {
-          wlerr("ERROR:  Failed to create buffer\n");
           return -ENOBUFS;
         }
     }
 
-  wlinfo("opcode %04x len %u\n", opcode, buf->len);
+  sync.response = NULL;
+  sync.result = -EIO;
+  ret = nxsem_init(&sync.sem, 0, 0);
+  if (ret < 0)
+    {
+      bt_buf_release(buf);
+      return ret;
+    }
 
-  /* Set up for the wait */
+  buf->u.hci.sync = &sync;
 
-  nxsem_init(&sync_sem, 0, 0);
-  buf->u.hci.sync = &sync_sem;
+  /* Retain the caller's reference until the context is detached. The queue
+   * consumes a separate reference, so completion cannot recycle the request
+   * while this waiter still needs to detach after success or timeout.
+   */
 
-  /* Send the frame */
-
+  bt_buf_addref(buf);
   ret = bt_queue_send(&g_btdev.tx_queue, buf, BT_NORMAL_PRIO);
   if (ret < 0)
     {
-      wlerr("ERROR: bt_queue_send() failed: %d\n", ret);
+      bt_buf_release(buf);
     }
   else
     {
-      /* Wait for the response to the command.  An I/O error will be
-       * declared if the response does not occur within the timeout
-       * interval.
-       *
-       * REVISIT: The cause of the timeout could be a failure to receive a
-       * response to a sent frame or, perhaps, a failure to send the frame.
-       * Should there also be logic to flush any unsent Tx packets?
-       */
-
-      ret = nxsem_tickwait_uninterruptible(&sync_sem,
+      ret = nxsem_tickwait_uninterruptible(&sync.sem,
                                            MSEC2TICK(TIMEOUT_MSEC));
     }
 
-  /* Indicate failure if we failed to get the response */
-
+  nxmutex_lock(&g_hci_sync_lock);
+  buf->u.hci.sync = NULL;
   if (ret >= 0)
     {
-      if (buf->u.hci.sync == NULL)
-        {
-          wlerr("ERROR:  Failed get return parameters\n");
-          ret = -EIO;
-        }
-      else
-        {
-          ret = 0;
-        }
+      ret = sync.result;
     }
 
-  /* Note: if ret < 0 the packet might just be delayed and could still
-   * be sent.  We cannot decrease the ref count since it if it was sent
-   * it buf could be pointed a completely different request.
-   */
+  nxmutex_unlock(&g_hci_sync_lock);
 
-  if (rsp != NULL)
+  if (ret == 0 && rsp != NULL)
     {
-      /* If the response is expected provide the sync response */
-
-      *rsp = buf->u.hci.sync;
+      *rsp = sync.response;
     }
-  else if (buf->u.hci.sync != NULL)
+  else if (sync.response != NULL)
     {
-      /* If a sync response was given but not requested drop it */
-
-      bt_buf_release(buf->u.hci.sync);
+      bt_buf_release(sync.response);
     }
 
-  nxsem_destroy(&sync_sem);
-
+  bt_buf_release(buf);
+  nxsem_destroy(&sync.sem);
   return ret;
 }
 
